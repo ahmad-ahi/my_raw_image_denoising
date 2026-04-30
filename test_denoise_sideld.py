@@ -81,7 +81,7 @@ if __name__ == "__main__":
     parser.add_argument("--testset_type", type=str, default="sid", choices=["sid", "eld"])
     parser.add_argument("--eval_ratio", type=int, default=100, help="100, 250, 300 for SID, and 100 and 200 for ELD")
 
-    _args = parser.parse_args(args=[])
+    _args = parser.parse_args()
 
     # fix seed
     np.random.seed(_args.seed)
