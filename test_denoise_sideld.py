@@ -66,8 +66,6 @@ def main(args):
     print(f"valid_psnr: {valid_psnr}, valid_ssim: {valid_ssim}")
 
 
-##--------------------------------------------------------------------------------------------------
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

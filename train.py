@@ -62,7 +62,6 @@ def main(args):
 
     os.makedirs(args.save_dir, exist_ok=True)
 
-    # ── Dataset ──────────────────────────────────────────────────────────────
     # We use ELD info file + dark frames from resources/
     # Dark frames are stored as pre-computed dark shading .npy files
     # We'll build a simple training set from ELD clean frames
@@ -179,14 +178,14 @@ def main(args):
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True,
                         num_workers=args.num_workers, pin_memory=True)
 
-    # ── Model ─────────────────────────────────────────────────────────────────
+    # Model and optimizer
     model     = build_model(args)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.epochs, eta_min=1e-6)
     criterion = nn.L1Loss()
 
-    # ── Training loop ─────────────────────────────────────────────────────────
+    #  Training loop 
     best_loss = float("inf")
     for epoch in range(1, args.epochs + 1):
         loss = train_one_epoch(model, loader, optimizer, criterion,
