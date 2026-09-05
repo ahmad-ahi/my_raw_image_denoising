@@ -53,6 +53,46 @@ def train_one_epoch(model, loader, optimizer, criterion, device, epoch):
     return np.mean(losses)
 
 
+def save_checkpoint(path, model, optimizer, scheduler, epoch, best_loss, args):
+    """Save a full checkpoint (model + optimizer + scheduler + metadata) so
+    training can resume exactly where it left off, mid-schedule."""
+    tmp_path = path + ".tmp"
+    torch.save({
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict(),
+        "epoch": epoch,
+        "best_loss": best_loss,
+        "args": vars(args),
+    }, tmp_path)
+    # Atomic rename: avoids a half-written checkpoint if the job is killed
+    # mid-save (e.g. HTCondor timeout landing exactly here).
+    os.replace(tmp_path, path)
+
+
+def find_resume_checkpoint(args):
+    """Resolve which checkpoint to resume from.
+
+    Priority:
+    1. Explicit --resume path, if given and it exists.
+    2. <save_dir>/<model>_latest.pth, if it exists (auto-resume — this is
+       what lets the OSPool wrapper script just re-run the same command
+       after every 4-hour timeout without any extra bookkeeping).
+    3. None -> start from scratch.
+    """
+    if args.resume:
+        if os.path.exists(args.resume):
+            return args.resume
+        print(f"WARNING: --resume path '{args.resume}' not found, "
+              f"falling back to auto-detect.")
+
+    latest_path = os.path.join(args.save_dir, f"{args.model}_latest.pth")
+    if os.path.exists(latest_path):
+        return latest_path
+
+    return None
+
+
 def main(args):
     # Reproducibility
     np.random.seed(args.seed)
@@ -186,22 +226,61 @@ def main(args):
     criterion = nn.L1Loss()
 
     #  Training loop 
+    start_epoch = 1
     best_loss = float("inf")
-    for epoch in range(1, args.epochs + 1):
+
+    resume_path = find_resume_checkpoint(args)
+    if resume_path:
+        ckpt = torch.load(resume_path, map_location=args.device)
+        model.load_state_dict(ckpt["model"])
+
+        # optimizer/scheduler state may be absent from older-style checkpoints;
+        # degrade gracefully instead of crashing if so.
+        if "optimizer" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer"])
+        if "scheduler" in ckpt:
+            scheduler.load_state_dict(ckpt["scheduler"])
+
+        start_epoch = ckpt.get("epoch", 0) + 1
+        best_loss = ckpt.get("best_loss", float("inf"))
+        print(f"Resumed from '{resume_path}': epoch {ckpt.get('epoch', '?')}, "
+              f"best_loss={best_loss:.5f}. Continuing at epoch {start_epoch}.")
+    else:
+        print("No checkpoint found, starting from scratch.")
+
+    if start_epoch > args.epochs:
+        print(f"start_epoch ({start_epoch}) > total epochs ({args.epochs}); "
+              f"nothing left to train. Exiting cleanly.")
+        return
+
+    latest_path = os.path.join(args.save_dir, f"{args.model}_latest.pth")
+    best_path   = os.path.join(args.save_dir, f"{args.model}_best.pth")
+
+    for epoch in range(start_epoch, args.epochs + 1):
         loss = train_one_epoch(model, loader, optimizer, criterion,
                                args.device, epoch)
         scheduler.step()
         print(f"Epoch {epoch}/{args.epochs} | Loss: {loss:.5f} | LR: {scheduler.get_last_lr()[0]:.2e}")
 
-        if loss < best_loss:
+        is_best = loss < best_loss
+        if is_best:
             best_loss = loss
-            torch.save(model.state_dict(),
-                       os.path.join(args.save_dir, f"{args.model}_best.pth"))
-            print(f"  → Saved best model (loss={best_loss:.5f})")
+
+        # Save a full-state checkpoint every epoch. This is what makes
+        # OSPool's exit-driven checkpointing (4h timeout -> exit 85 -> requeue)
+        # safe: whenever the job gets cut off, at most one epoch of progress
+        # is lost, and the next run auto-resumes from here.
+        save_checkpoint(latest_path, model, optimizer, scheduler, epoch, best_loss, args)
+
+        if is_best:
+            save_checkpoint(best_path, model, optimizer, scheduler, epoch, best_loss, args)
+            print(f"  -> Saved best model (loss={best_loss:.5f})")
 
         if epoch % args.save_every == 0:
-            torch.save(model.state_dict(),
-                       os.path.join(args.save_dir, f"{args.model}_ep{epoch}.pth"))
+            epoch_path = os.path.join(args.save_dir, f"{args.model}_ep{epoch}.pth")
+            save_checkpoint(epoch_path, model, optimizer, scheduler, epoch, best_loss, args)
+
+    print(f"Training complete: {args.epochs} epochs, best_loss={best_loss:.5f}")
 
 
 if __name__ == "__main__":
@@ -221,6 +300,10 @@ if __name__ == "__main__":
     parser.add_argument("--qe_max",          type=float, default=0.70,      help="Max QE for K sampling")
     parser.add_argument("--num_workers",     type=int,   default=4)
     parser.add_argument("--save_every",      type=int,   default=50)
+    parser.add_argument("--resume", type=str, default="",
+                         help="Path to a checkpoint to resume from. If omitted "
+                              "(or the path doesn't exist), auto-resumes from "
+                              "<save_dir>/<model>_latest.pth if present.")
     parser.add_argument("--seed",            type=int,   default=1)
     _args = parser.parse_args()
     main(_args)
