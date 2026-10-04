@@ -175,8 +175,6 @@ checkpoints/**/*.pth
 checkpoints/*.pth
 
 # Large calibration/resource arrays
-resources/SonyA7S2/*.npy
-resources/IMX686/*.npy
 
 # Local/backup files
 *.bak
