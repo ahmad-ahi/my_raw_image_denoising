@@ -35,10 +35,11 @@ def tiled_forward(model, x, tile=512, overlap=64):
 
 def build_model(args):
     model = NAFNet(in_nc=4, out_nc=4, width=32).to(args.device)
-    model.load_state_dict(torch.load(args.cp_dir, map_location="cpu"), strict=True)
+    ckpt = torch.load(args.cp_dir, map_location="cpu", weights_only=False)
+    state_dict = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
+    model.load_state_dict(state_dict, strict=True)
     model.eval()
     return model
-
 
 def build_dataloader(args):
     DSLRValidSet = {"sid": SIDEvalDataset, "eld": ELDPairEvalDataset}
@@ -56,7 +57,10 @@ def valid_one_ep(model, valid_loader, args, plot_res=False):
         imgs_hr, imgs_lr = tensor_dim5to4(data["hr"]).to(args.device), tensor_dim5to4(data["lr"]).to(args.device)
 
         imgs_dn = tiled_forward(model, imgs_lr, tile=512, overlap=64)
-
+        if data_id == 0:
+       	 print(f"DEBUG imgs_lr: min={imgs_lr.min().item():.4f}, max={imgs_lr.max().item():.4f}, mean={imgs_lr.mean().item():.4f}")
+       	 print(f"DEBUG imgs_hr: min={imgs_hr.min().item():.4f}, max={imgs_hr.max().item():.4f}, mean={imgs_hr.mean().item():.4f}")
+       	 print(f"DEBUG imgs_dn (before correct): min={imgs_dn.min().item():.4f}, max={imgs_dn.max().item():.4f}, mean={imgs_dn.mean().item():.4f}")
         imgs_dn = ELDIlluminanceCorrect().correct(imgs_dn, imgs_hr)
         imgs_dn, imgs_hr = torch.clamp(imgs_dn, 0, 1), torch.clamp(imgs_hr, 0, 1)
 

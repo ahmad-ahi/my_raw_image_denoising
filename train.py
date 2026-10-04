@@ -2,6 +2,10 @@
 Training script for improved RAW image denoising.
 Improvement 1: K sampled from QE range [0.30, 0.70] instead of fixed 0.40
 Improvement 2: NAFNet backbone instead of U-Net
+Improvement 3: Combined SID + ELD clean training pool (161 + 70 = 231 images)
+Improvement 4 (experimental): approximate additive read-noise term to partially
+    account for the real per-pixel sensor noise the paper's method captures via
+    real dark frames, which we do not have access to (only calibrated shading).
 """
 import os
 os.environ["OPENMP_NUM_THREADS"] = "4"
@@ -22,7 +26,8 @@ def build_model(args):
     if args.model == "nafnet":
         model = NAFNet(in_nc=4, out_nc=4, width=args.width,
                        enc_blocks=[2, 2, 4, 8],
-                       dec_blocks=[2, 2, 2, 2]).to(args.device)
+                       dec_blocks=[2, 2, 2, 2],
+                       middle_blk_num=args.middle_blk_num).to(args.device)
         print(f"NAFNet: {sum(p.numel() for p in model.parameters())/1e6:.2f}M params")
     else:
         model = UNetSeeInDark().to(args.device)
@@ -102,33 +107,57 @@ def main(args):
 
     os.makedirs(args.save_dir, exist_ok=True)
 
-    # We use ELD info file + dark frames from resources/
-    # Dark frames are stored as pre-computed dark shading .npy files
-    # We'll build a simple training set from ELD clean frames
     import pickle as pkl, rawpy
     from torch.utils.data import Dataset
 
     class SimpleTrainDataset(Dataset):
         """
         Simplified training dataset:
-        - Clean frames from ELD dataset (ratio=1 images)
+        - Clean frames pooled from multiple sources (SID train split + ELD
+          ratio=1 frames), given as a comma-separated list of .info files
         - Noise synthesized on-the-fly
         - K sampled from QE range (Improvement 1)
-        - Dark frames sampled directly (Improvement 2 of paper)
+        - Dark shading subtracted/re-applied to match eval's convention
+
+        NOTE on `ratio`: this matches the paper's eval-time convention
+        (see datasets/real_dataset.py) where `ratio` is a brightness-matching
+        digital gain applied EXACTLY ONCE, after normalization, uniformly to
+        the whole signal (including its noise):
+            lr_raw = raw - dark_shading
+            lr     = pack_normalize(lr_raw)
+            lr     = lr * ratio
+
+        NOTE on read noise: real eval images contain the sensor's actual
+        signal-independent noise (read noise, banding, etc.) baked in, which
+        the paper's own pipeline synthesizes by adding a REAL sampled dark
+        frame. We don't have real dark frame samples, only the calibrated
+        (deterministic) shading coefficients, so as an approximation we
+        optionally add zero-mean Gaussian noise scaled by --read_noise_std
+        and by sqrt(iso/100) as a simple ISO-dependent heuristic. This is a
+        best-effort approximation, not a calibrated match to the paper's
+        approach — worth ablating (--read_noise_std 0 disables it).
         """
-        def __init__(self, info_path, dark_shading_dir, patch_size=512,
-                     qe_range=(0.30, 0.70), wl=16383, bl=512, n_per_image=4):
-            with open(info_path, "rb") as f:
-                data = pkl.load(f)
+        def __init__(self, info_paths, dark_shading_dir, data_root, patch_size=512,
+                     qe_range=(0.30, 0.70), wl=16383, bl=512, n_per_image=4,
+                     read_noise_std=0.0):
             self.samples = []
-            for scene in data:
-                for item in scene:
-                    if item["ratio"] == 1:
-                        self.samples.append(item)
+            for info_path in info_paths:
+                with open(info_path, "rb") as f:
+                    data = pkl.load(f)
+                n_added = 0
+                for scene in data:
+                    for item in scene:
+                        if item["ratio"] == 1:
+                            self.samples.append(item)
+                            n_added += 1
+                print(f"  Loaded {n_added} clean frames from {info_path}")
+
+            self.data_root = data_root
             self.patch_size = patch_size
             self.qe_range   = qe_range
             self.wl, self.bl = wl, bl
             self.n = n_per_image
+            self.read_noise_std = read_noise_std
 
             # Load precomputed dark shadings from resources
             dsk_high = np.load(f"{dark_shading_dir}/darkshading_highISO_k.npy")
@@ -142,7 +171,8 @@ def main(args):
             self.dsk_low  = dsk_low
             self.dsb_low  = dsb_low
             self.ble = ble
-            print(f"Dataset: {len(self.samples)} clean frames × {n_per_image} patches")
+            print(f"Dataset: {len(self.samples)} total clean frames × {n_per_image} patches "
+                  f"(read_noise_std={read_noise_std})")
 
         def get_darkshading(self, iso):
             if iso <= 1600:
@@ -173,7 +203,8 @@ def main(args):
             iso   = item["ISO"]
             ratio = float(np.random.choice([100, 200]))
 
-            raw   = rawpy.imread(item["data"]).raw_image_visible.astype(np.float32)
+            raw_path = os.path.join(self.data_root, item["data"])
+            raw = rawpy.imread(raw_path).raw_image_visible.astype(np.float32)
             # HR: normalized clean
             hr_raw = raw.copy()
 
@@ -184,11 +215,29 @@ def main(args):
             # Pack HR
             hr = self.pack(hr_raw, norm=True, clip=True)   # [H/2, W/2, 4]
 
-            # Add shot noise to LR
+            # Shot noise: attenuate signal by ratio (simulating a shorter/
+            # dimmer exposure), sample Poisson, matches paper's K*P(I/K).
             K   = self.sample_K(iso)
             lr_signal = np.clip(lr_raw / (self.wl - self.bl) / ratio, 0, None)
             shot = np.random.poisson(np.maximum(lr_signal / K, 1e-6)).astype(np.float32) * K
-            lr   = self.pack(ds + shot * (self.wl - self.bl) * ratio + ds, norm=True, clip=False)
+
+            # Approximate signal-independent read noise (see class docstring).
+            # Added in the same normalized-domain units as `shot`, BEFORE the
+            # single ratio re-inflation below, so it gets scaled uniformly
+            # along with the signal -- matching how ratio is applied to real
+            # data's whole signal (including its inherent noise) at eval time.
+            if self.read_noise_std > 0:
+                iso_scale = np.sqrt(max(iso, 100) / 100.0)
+                read_noise = np.random.normal(
+                    0, self.read_noise_std * iso_scale, size=shot.shape
+                ).astype(np.float32)
+                shot = shot + read_noise
+
+            # Re-inflate by `ratio` exactly once here (matches eval's single
+            # `lr_crops *= self.eval_ratio` applied after normalization), and
+            # do NOT re-add dark shading — it was already subtracted above and
+            # eval never adds it back either.
+            lr = self.pack(shot * (self.wl - self.bl) * ratio, norm=True, clip=False)
 
             # Crop
             ps = self.patch_size
@@ -205,24 +254,34 @@ def main(args):
 
             hr = torch.FloatTensor(hr.copy()).permute(2,0,1).unsqueeze(0)
             lr = torch.FloatTensor(lr.copy()).permute(2,0,1).unsqueeze(0)
-            lr = torch.clamp(lr * ratio, -1, 10)
+            # No extra ratio multiplication here — already applied once above.
+            lr = torch.clamp(lr, -1, 10)
             return {"hr": hr, "lr": lr, "iso": iso, "ratio": ratio}
 
+    info_paths = [p.strip() for p in args.info_paths.split(",") if p.strip()]
     dataset = SimpleTrainDataset(
-        info_path        = args.info_path,
+        info_paths       = info_paths,
         dark_shading_dir = args.dark_shading_dir,
+        data_root        = args.data_root,
         patch_size       = args.patch_size,
         qe_range         = (args.qe_min, args.qe_max),
         n_per_image      = args.n_per_image,
+        read_noise_std   = args.read_noise_std,
     )
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True,
                         num_workers=args.num_workers, pin_memory=True)
 
     # Model and optimizer
     model     = build_model(args)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.epochs, eta_min=1e-6)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,
+                                   betas=(0.9, 0.9), weight_decay=0.0)
+    warmup_epochs = max(1, int(0.02 * args.epochs))
+    warmup = torch.optim.lr_scheduler.LinearLR(
+        optimizer, start_factor=0.01, total_iters=warmup_epochs)
+    cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.epochs - warmup_epochs, eta_min=1e-6)
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        optimizer, schedulers=[warmup, cosine], milestones=[warmup_epochs])
     criterion = nn.L1Loss()
 
     #  Training loop 
@@ -231,11 +290,9 @@ def main(args):
 
     resume_path = find_resume_checkpoint(args)
     if resume_path:
-        ckpt = torch.load(resume_path, map_location=args.device)
+        ckpt = torch.load(resume_path, map_location=args.device, weights_only=False)
         model.load_state_dict(ckpt["model"])
 
-        # optimizer/scheduler state may be absent from older-style checkpoints;
-        # degrade gracefully instead of crashing if so.
         if "optimizer" in ckpt:
             optimizer.load_state_dict(ckpt["optimizer"])
         if "scheduler" in ckpt:
@@ -266,10 +323,6 @@ def main(args):
         if is_best:
             best_loss = loss
 
-        # Save a full-state checkpoint every epoch. This is what makes
-        # OSPool's exit-driven checkpointing (4h timeout -> exit 85 -> requeue)
-        # safe: whenever the job gets cut off, at most one epoch of progress
-        # is lost, and the next run auto-resumes from here.
         save_checkpoint(latest_path, model, optimizer, scheduler, epoch, best_loss, args)
 
         if is_best:
@@ -286,9 +339,15 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model",           type=str,   default="nafnet",  choices=["nafnet","unet"])
-    parser.add_argument("--width",           type=int,   default=32,        help="NAFNet base channels")
-    parser.add_argument("--info_path",       type=str,   default="./infos/ELD_SonyA7S2.info")
+    parser.add_argument("--width", type=int, default=32, help="NAFNet base width")
+    parser.add_argument("--middle_blk_num", type=int, default=12, help="NAFNet bottleneck depth")
+    parser.add_argument("--info_paths",      type=str,   default="./infos/SID_train.info,./infos/ELD_SonyA7S2.info",
+                         help="Comma-separated list of .info files to pool clean training frames from.")
     parser.add_argument("--dark_shading_dir",type=str,   default="./resources/SonyA7S2")
+    parser.add_argument("--data_root",       type=str,   default="../data",
+                         help="Root directory prepended to relative paths in the info files. "
+                              "Leave empty if info files already store absolute/self-contained paths "
+                              "(both SID_train.info and ELD_SonyA7S2.info do by default on am56).")
     parser.add_argument("--save_dir",        type=str,   default="./checkpoints/improved")
     parser.add_argument("--device",          type=str,   default="cuda:0")
     parser.add_argument("--patch_size",      type=int,   default=512)
@@ -298,6 +357,9 @@ if __name__ == "__main__":
     parser.add_argument("--lr",              type=float, default=2e-4)
     parser.add_argument("--qe_min",          type=float, default=0.30,      help="Min QE for K sampling")
     parser.add_argument("--qe_max",          type=float, default=0.70,      help="Max QE for K sampling")
+    parser.add_argument("--read_noise_std",  type=float, default=0.0,
+                         help="Approximate additive read-noise std (normalized-domain units, "
+                              "pre-ratio). 0 disables it. Experimental heuristic -- see docstring.")
     parser.add_argument("--num_workers",     type=int,   default=4)
     parser.add_argument("--save_every",      type=int,   default=50)
     parser.add_argument("--resume", type=str, default="",

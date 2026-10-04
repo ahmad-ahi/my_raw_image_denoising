@@ -1,0 +1,30 @@
+universe = container
+container_image = osdf:///ospool/ap40/data/ahmad.majidy/pytorch.sif
+
+executable = train.sh
+
+
+transfer_input_files = train.sh, \
+                        osdf:///ospool/ap40/data/ahmad.majidy/code_v5.tar.gz, \
+                        osdf:///ospool/ap40/data/ahmad.majidy/sid_eld.tar.gz, \
+                        osdf:///ospool/ap40/data/ahmad.majidy/improved
+transfer_output_files = raw_image_denoising/checkpoints/improved
+
+checkpoint_exit_code = 85
+transfer_checkpoint_files = raw_image_denoising/checkpoints/improved
+should_transfer_files = yes
+when_to_transfer_output = ON_EXIT_OR_EVICT
+
+log    = /home/ahmad.majidy/train_$(Cluster).log
+output = /home/ahmad.majidy/train_$(Cluster).out
+error  = /home/ahmad.majidy/train_$(Cluster).err
+
++JobDurationCategory = "Long"
+
+request_cpus   = 4
+request_memory = 16GB
+request_disk   = 180GB
+request_gpus   = 1
+gpus_minimum_memory = 16000
+
+queue 1

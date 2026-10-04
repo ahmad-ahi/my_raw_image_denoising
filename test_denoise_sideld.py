@@ -17,7 +17,9 @@ from models.ELD_models import UNetSeeInDark
 
 def build_model(args):
     model = UNetSeeInDark().to(args.device)
-    model.load_state_dict(torch.load(args.cp_dir, map_location="cpu"), strict=True)
+    ckpt = torch.load(args.cp_dir, map_location="cpu", weights_only=False)
+    state_dict = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
+    model.load_state_dict(state_dict, strict=True)
     model.eval()
     return model
 

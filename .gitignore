@@ -165,3 +165,18 @@ cython_debug/
 .DS_Store
 *.pth
 *.info
+
+# Project-specific large/generated files
+*.tar.gz
+*.zip
+
+# Model checkpoints
+checkpoints/**/*.pth
+checkpoints/*.pth
+
+# Large calibration/resource arrays
+resources/SonyA7S2/*.npy
+resources/IMX686/*.npy
+
+# Local/backup files
+*.bak

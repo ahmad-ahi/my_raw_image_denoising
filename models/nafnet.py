@@ -34,13 +34,14 @@ class NAFBlock(nn.Module):
         self.conv2 = nn.Conv2d(dw_channel, dw_channel, 3, 1, 1, groups=dw_channel)
         self.conv3 = nn.Conv2d(dw_channel // 2, c, 1)
 
-        # Channel attention
-        self.se = nn.Sequential(
+        # Simplified Channel Attention (SCA): a plain linear 1x1 conv gate,
+        # no activation function at all -- this is the "nonlinear activation
+        # free" design the architecture is named for. The previous version
+        # here added ReLU+Sigmoid, which fights the SimpleGate mechanism and
+        # deviates from the reference design.
+        self.sca = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(dw_channel // 2, c // 2, 1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(c // 2, dw_channel // 2, 1),
-            nn.Sigmoid()
+            nn.Conv2d(dw_channel // 2, dw_channel // 2, 1),
         )
 
         # FFN
@@ -63,7 +64,7 @@ class NAFBlock(nn.Module):
         x = self.conv1(x)
         x = self.conv2(x)
         x = self.gate(x)
-        x = x * self.se(x)
+        x = x * self.sca(x)
         x = self.conv3(x)
         x = self.dropout(x)
         y = inp + x * self.beta
@@ -80,6 +81,7 @@ class NAFNet(nn.Module):
     def __init__(self, in_nc=4, out_nc=4, width=32,
                  enc_blocks=[2, 2, 4, 8],
                  dec_blocks=[2, 2, 2, 2],
+                 middle_blk_num=12,
                  drop_out_rate=0.):
         super().__init__()
 
@@ -100,7 +102,11 @@ class NAFNet(nn.Module):
             self.downs.append(nn.Conv2d(chan, chan * 2, 2, 2))
             chan *= 2
 
-        self.middle_blks = nn.Sequential(*[NAFBlock(chan) for _ in range(4)])
+        # Bottleneck depth: the previous version fixed this at 4 regardless
+        # of encoder depth, undersizing the model's capacity at its deepest
+        # point relative to the reference configuration (commonly 12 for
+        # enc_blocks=[2,2,4,8]).
+        self.middle_blks = nn.Sequential(*[NAFBlock(chan) for _ in range(middle_blk_num)])
 
         for num in dec_blocks:
             self.ups.append(nn.Sequential(
