@@ -202,10 +202,15 @@ def main(args):
             item = self.samples[idx % len(self.samples)]
             iso   = item["ISO"]
             ratio = float(np.random.choice([100, 200]))
-
             raw_path = os.path.join(self.data_root, item["data"])
-            raw = rawpy.imread(raw_path).raw_image_visible.astype(np.float32)
-            # HR: normalized clean
+            for attempt in range(3):
+                try:
+                    raw = rawpy.imread(raw_path).raw_image_visible.astype(np.float32)
+                    break
+                except Exception as e:
+                    if attempt == 2:
+                        raise
+                    import time; time.sleep(1)
             hr_raw = raw.copy()
 
             # Subtract dark shading for LR
