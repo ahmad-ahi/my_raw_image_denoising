@@ -273,6 +273,19 @@ def main(args):
         n_per_image      = args.n_per_image,
         read_noise_std   = args.read_noise_std,
     )
+    # Pre-flight: confirm every training file is reachable before training starts.
+    missing, n_abs = [], 0
+    for item in dataset.samples:
+        if os.path.isabs(item["data"]):
+            n_abs += 1
+        p = os.path.join(args.data_root, item["data"])
+        if not os.path.exists(p):
+            missing.append(p)
+    print(f"Pre-flight: {len(dataset.samples)} files, {n_abs} stored as absolute paths, {len(missing)} missing")
+    if missing:
+        for p in missing[:5]:
+            print(f"  MISSING: {p}")
+        raise SystemExit(2)
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True,
                         num_workers=args.num_workers, pin_memory=True)
 
@@ -284,7 +297,7 @@ def main(args):
     warmup = torch.optim.lr_scheduler.LinearLR(
         optimizer, start_factor=0.01, total_iters=warmup_epochs)
     cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.epochs - warmup_epochs, eta_min=1e-6)
+        optimizer, T_max=max(1, args.epochs - warmup_epochs), eta_min=1e-6)
     scheduler = torch.optim.lr_scheduler.SequentialLR(
         optimizer, schedulers=[warmup, cosine], milestones=[warmup_epochs])
     criterion = nn.L1Loss()
